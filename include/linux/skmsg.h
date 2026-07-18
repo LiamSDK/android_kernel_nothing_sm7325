@@ -12,6 +12,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/strparser.h>
+#include <linux/slab.h>
 
 #define MAX_MSG_FRAGS			MAX_SKB_FRAGS
 #define NR_MSG_FRAG_IDS			(MAX_MSG_FRAGS + 1)
@@ -325,8 +326,127 @@ static inline void sk_psock_start_strp(struct sock *sk, struct sk_psock *psock)
 static inline void sk_psock_stop_strp(struct sock *sk, struct sk_psock *psock)
 {
 }
+#endif
 
 void sk_psock_start_verdict(struct sock *sk, struct sk_psock *psock);
 void sk_psock_stop_verdict(struct sock *sk, struct sk_psock *psock);
+
+static inline void sk_psock_set_state(struct sk_psock *psock,
+				      enum sk_psock_state_bits bit)
+{
+	set_bit(bit, &psock->state);
+}
+
+static inline void sk_psock_clear_state(struct sk_psock *psock,
+					enum sk_psock_state_bits bit)
+{
+	clear_bit(bit, &psock->state);
+}
+
+static inline bool sk_psock_test_state(const struct sk_psock *psock,
+				       enum sk_psock_state_bits bit)
+{
+	return test_bit(bit, &psock->state);
+}
+
+struct sk_psock_link *sk_psock_link_pop(struct sk_psock *psock);
+
+int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
+			 struct sk_msg *msg);
+
+static inline struct sk_psock *sk_psock_get(struct sock *sk)
+{
+	struct sk_psock *psock;
+
+	rcu_read_lock();
+	psock = sk_psock(sk);
+	if (psock && !refcount_inc_not_zero(&psock->refcnt))
+		psock = NULL;
+	rcu_read_unlock();
+	return psock;
+}
+
+static inline void sk_psock_restore_proto(struct sock *sk,
+					  struct sk_psock *psock)
+{
+	if (psock->sk_proto) {
+		struct proto *prot = psock->sk_proto;
+
+		psock->sk_proto = NULL;
+		WRITE_ONCE(sk->sk_prot, prot);
+	}
+}
+
+static inline void sk_psock_update_proto(struct sock *sk,
+					 struct sk_psock *psock,
+					 struct proto *ops)
+{
+	/* Pairs with lockless read in sk_clone_lock() */
+	WRITE_ONCE(sk->sk_prot, ops);
+}
+
+void sk_psock_drop(struct sock *sk, struct sk_psock *psock);
+
+static inline void sk_psock_put(struct sock *sk, struct sk_psock *psock)
+{
+	if (refcount_dec_and_test(&psock->refcnt))
+		sk_psock_drop(sk, psock);
+}
+
+static inline void sk_psock_data_ready(struct sock *sk, struct sk_psock *psock)
+{
+	if (psock->parser.enabled)
+		psock->parser.saved_data_ready(sk);
+	else
+		sk->sk_data_ready(sk);
+}
+
+static inline void psock_set_prog(struct bpf_prog **pprog,
+				  struct bpf_prog *prog)
+{
+	prog = xchg(pprog, prog);
+	if (prog)
+		bpf_prog_put(prog);
+}
+
+static inline void psock_progs_drop(struct sk_psock_progs *progs)
+{
+	psock_set_prog(&progs->msg_parser, NULL);
+	psock_set_prog(&progs->skb_parser, NULL);
+	psock_set_prog(&progs->skb_verdict, NULL);
+}
+
+static inline int psock_replace_prog(struct bpf_prog **pprog,
+				     struct bpf_prog *prog,
+				     struct bpf_prog *old)
+{
+	if (cmpxchg(pprog, old, prog) != old)
+		return -ENOENT;
+
+	if (old)
+		bpf_prog_put(old);
+
+	return 0;
+}
+
+static inline struct sk_psock_link *sk_psock_init_link(void)
+{
+	return kzalloc(sizeof(struct sk_psock_link),
+		       GFP_ATOMIC | __GFP_NOWARN);
+}
+
+static inline void sk_psock_free_link(struct sk_psock_link *link)
+{
+	kfree(link);
+}
+
+static inline void sk_psock_cork_free(struct sk_psock *psock)
+{
+	if (psock->cork) {
+		sk_msg_free(psock->sk, psock->cork);
+		kfree(psock->cork);
+		psock->cork = NULL;
+	}
+}
 
 #endif /* _LINUX_SKMSG_H */
